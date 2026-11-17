@@ -2623,6 +2623,10 @@ body.locked { overflow: hidden; }
 .send-row { display: flex; gap: 0.6rem; flex-wrap: wrap; }
 .send-code { flex: 1 1 260px; min-width: 0; box-sizing: border-box; padding: 0.6rem 0.8rem; border-radius: var(--radius-sm); border: 1px solid var(--border-medium); background: var(--bg-base); color: var(--text-main); font-family: var(--font-mono); font-size: 0.78rem; }
 .send-summary { margin-top: 0.9rem; font-weight: 700; color: var(--teal-accent); font-size: 0.95rem; }
+.login-session-note { display: grid; gap: 0.3rem; padding: 0.8rem 0.95rem; border: 1px solid var(--border-glow); border-radius: var(--radius-sm); background: var(--bg-surface-elevated); text-align: left; }
+.login-session-note span { color: var(--text-secondary); font-size: 0.82rem; font-weight: 700; }
+.login-session-note strong { color: var(--teal-accent); font: 800 1.5rem var(--font-mono); letter-spacing: 0.12em; }
+.login-session-note small { color: var(--text-muted); line-height: 1.45; }
 @media print { .login-backdrop, .send-box { display: none !important; } }
 
 /* ==========================================================================
@@ -2791,7 +2795,10 @@ h1, h2, h3, h4, .hero-title, .section-title, .brand-title { font-family: var(--f
     <form class="login-card" id="login-form" autocomplete="off" novalidate>
       <div class="brand-icon-box login-icon"></div>
       <h1 id="login-title">Welcome to the NIHL WebQuest</h1>
-      <p class="login-sub">Type your name to begin. Your name goes with your worksheet score. No email or password needed.</p>
+      <p class="login-sub">Enter your coach's session code and your name to join. Your checked scores will appear on the coach's screen.</p>
+      <label for="login-session-code" class="login-label">Coach's 6-digit session code</label>
+      <input type="text" id="login-session-code" class="login-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="Enter session code">
+      <small class="login-session-help">Ask your coach for the code, then enter your name to join.</small>
       <label for="login-name" class="login-label">Your name</label>
       <input type="text" id="login-name" class="login-input" maxlength="60" placeholder="First and last name" autocomplete="off">
       <div class="login-error" id="login-error" role="alert"></div>
@@ -4305,6 +4312,9 @@ h1, h2, h3, h4, .hero-title, .section-title, .brand-title { font-family: var(--f
                 <button type="button" class="btn btn-primary" id="send-copy">Copy score code</button>
               </div>
               <div class="send-summary" id="send-summary" aria-live="polite"></div>
+              <div class="send-summary" id="live-score-status" role="status" aria-live="polite"></div>
+              <p class="send-sub">Your score is sent to your coach while the session is live. The score code and session file are backups.</p>
+              <button type="button" class="btn btn-secondary" id="send-session-download">Download session data</button>
             </div>
           </div>
         </div>
@@ -4464,6 +4474,8 @@ h1, h2, h3, h4, .hero-title, .section-title, .brand-title { font-family: var(--f
 /* ---- Student login + score log helpers ---- */
 const SCORE_SALT = 'nihl-salt-2026';
 let CURRENT_STUDENT = '';
+let CURRENT_PARTICIPANT_ID = '';
+const API_BASE = location.protocol === 'file:' ? 'http://127.0.0.1:8765' : '';
 function slugName(n) { return String(n || '').toLowerCase().replace(/\s+/g, ' ').trim(); }
 function ukey(base) { return base + ':' + slugName(CURRENT_STUDENT); }
 function sessGet(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }
@@ -4476,23 +4488,63 @@ function fnv(s) {
 }
 const LOG_KEY = 'hosa_nihl_log';
 function readLog() { try { return JSON.parse(safeGet(LOG_KEY) || '{}') || {}; } catch (e) { return {}; } }
+const SESSION_LOG_KEY = 'hosa_nihl_sessions';
+function readSessions() { try { const v = JSON.parse(safeGet(SESSION_LOG_KEY) || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; } }
+function writeSessions(sessions) { safeSet(SESSION_LOG_KEY, JSON.stringify(sessions)); }
+function newSessionCode() {
+  const used = new Set(readSessions().map(s => String(s.id || '')));
+  let id = '';
+  do {
+    let number;
+    try { const bytes = new Uint32Array(1); crypto.getRandomValues(bytes); number = bytes[0] % 1000000; }
+    catch (e) { number = Math.floor(Math.random() * 1000000); }
+    id = String(number).padStart(6, '0');
+  } while (used.has(id));
+  return id;
+}
+function ensureSession(name, sessionId, source) {
+  const sessions = readSessions();
+  const id = /^[0-9]{6}$/.test(String(sessionId || '')) ? String(sessionId) : newSessionCode();
+  let session = sessions.find(s => s.id === id);
+  if (!session) {
+    session = { id, name: name || 'Student', startedAt: Date.now(), source: source || 'automatic', attempts: [], importedCodes: [] };
+    sessions.push(session);
+  } else {
+    if (name) session.name = name;
+    if (!Array.isArray(session.attempts)) session.attempts = [];
+    if (!Array.isArray(session.importedCodes)) session.importedCodes = [];
+  }
+  writeSessions(sessions);
+  return session;
+}
 function recordAttempt(name, correct, total) {
+  const now = Date.now();
   const log = readLog();
   const k = slugName(name);
   const rec = log[k] || { n: name, attempts: [] };
   rec.n = name;
   const last = rec.attempts[rec.attempts.length - 1];
-  if (!last || last.c !== correct || last.t !== total) rec.attempts.push({ c: correct, t: total, ts: Date.now() });
-  else last.ts = Date.now();
+  if (!last || last.c !== correct || last.t !== total) rec.attempts.push({ c: correct, t: total, ts: now });
+  else last.ts = now;
   if (rec.attempts.length > 50) rec.attempts = rec.attempts.slice(-50);
+  rec.sessionId = CURRENT_SESSION_ID;
   log[k] = rec;
   safeSet(LOG_KEY, JSON.stringify(log));
+
+  const sessions = readSessions();
+  let session = sessions.find(s => s.id === CURRENT_SESSION_ID);
+  if (!session) { session = { id: CURRENT_SESSION_ID, name, startedAt: now, source: 'automatic', attempts: [], importedCodes: [] }; sessions.push(session); }
+  if (!Array.isArray(session.attempts)) session.attempts = [];
+  session.name = name;
+  session.attempts.push({ n: name, participantId: CURRENT_PARTICIPANT_ID, c: correct, t: total, ts: now, source: 'automatic' });
+  writeSessions(sessions);
+  document.dispatchEvent(new CustomEvent('nihl:scores-updated'));
   return rec;
 }
 function scoreCodeFor(rec) {
   const last = rec.attempts[rec.attempts.length - 1];
   const best = Math.max.apply(null, rec.attempts.map(a => a.c));
-  const json = JSON.stringify({ n: rec.n, c: last.c, t: last.t, b: best, a: rec.attempts.length, ts: last.ts });
+  const json = JSON.stringify({ n: rec.n, c: last.c, t: last.t, b: best, a: rec.attempts.length, ts: last.ts, sid: rec.sessionId || CURRENT_SESSION_ID || '' });
   return 'NIHL1.' + btoa(unescape(encodeURIComponent(json))).replace(/=+$/, '') + '.' + fnv(json + SCORE_SALT);
 }
 
@@ -4518,6 +4570,7 @@ document.addEventListener('DOMContentLoaded', () => {
   initAccessibilityPanel();
   initContactPage();
   initLogin(() => { initFillInTheBlanks(); initProgressTracker(); });
+  initSessionExport();
   initScrollProgress();
 });
 
@@ -5587,6 +5640,7 @@ function initFillInTheBlanks() {
     persist();
     const rec = recordAttempt(CURRENT_STUDENT, correctCount, blanks.length);
     renderSendBox(rec);
+    sendScoreToCoach(correctCount, blanks.length);
   }
 
   if (clearBtn) {
@@ -5761,7 +5815,7 @@ function initAccessibilityPanel() {
   if (whoLabel) whoLabel.textContent = CURRENT_STUDENT || 'not signed in';
   document.addEventListener('nihl:login', (e) => { if (whoLabel) whoLabel.textContent = e.detail.name; });
   const switchBtn = document.getElementById('a11y-switch');
-  if (switchBtn) switchBtn.addEventListener('click', () => { sessDel('hosa_nihl_student'); location.reload(); });
+  if (switchBtn) switchBtn.addEventListener('click', () => { sessDel('hosa_nihl_student'); sessDel('hosa_nihl_session_id'); sessDel('hosa_nihl_participant_id'); location.reload(); });
 
   const readout = document.getElementById('a11y-size-readout');
   const fontToggle = document.getElementById('a11y-font-toggle');
@@ -6082,38 +6136,92 @@ function initLogin(onReady) {
   const screen = document.getElementById('login-screen');
   const form = document.getElementById('login-form');
   const input = document.getElementById('login-name');
+  const codeInput = document.getElementById('login-session-code');
   const err = document.getElementById('login-error');
   const app = document.querySelector('.app-wrapper');
   let started = false;
 
-  function begin(name) {
+  async function begin(name, requestedCode, existingParticipantId) {
+    const code = String(requestedCode || '').trim();
+    if (!/^[0-9]{6}$/.test(code)) throw new Error('Enter the six-digit code from your coach.');
+    let participantId = existingParticipantId || '';
+    if (!participantId) {
+      let response;
+      try {
+        response = await fetch(API_BASE + '/api/sessions/' + code + '/join', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name })
+        });
+      } catch (e) {
+        if (location.protocol !== 'file:') throw new Error('The coach session server is not reachable. Check the student link from your coach.');
+        participantId = 'offline-' + (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+      }
+      if (response) {
+        let result = {};
+        try { result = await response.json(); } catch (e) {}
+        if (!response.ok) {
+          if (location.protocol !== 'file:') throw new Error(result.error || 'That session code is not active. Check with your coach.');
+          participantId = 'offline-' + (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+        } else participantId = result.participantId;
+      }
+    }
     CURRENT_STUDENT = name;
+    CURRENT_SESSION_ID = code;
+    CURRENT_PARTICIPANT_ID = participantId;
     sessSet('hosa_nihl_student', name);
+    sessSet('hosa_nihl_session_id', code);
+    sessSet('hosa_nihl_participant_id', participantId);
+    ensureSession(name, code, 'live');
     if (screen) screen.hidden = true;
     if (app) app.inert = false;
     document.body.classList.remove('locked');
-    document.dispatchEvent(new CustomEvent('nihl:login', { detail: { name } }));
+    document.dispatchEvent(new CustomEvent('nihl:login', { detail: { name, sessionId: code } }));
     if (!started) { started = true; onReady(); }
   }
 
   const saved = sessGet('hosa_nihl_student');
-  if (saved) { begin(saved); return; }
-  if (!screen || !form) { begin('Student'); return; }
+  const savedCode = sessGet('hosa_nihl_session_id');
+  const savedParticipant = sessGet('hosa_nihl_participant_id');
+  if (saved && savedCode && savedParticipant) {
+    begin(saved, savedCode, savedParticipant).catch(e => { if (err) err.textContent = e.message; });
+    return;
+  }
+  if (!screen || !form) { return; }
 
   screen.hidden = false;
   if (app) app.inert = true;
   document.body.classList.add('locked');
-  setTimeout(() => { try { input.focus(); } catch (e) {} }, 50);
+  setTimeout(() => { try { codeInput.focus(); } catch (e) {} }, 50);
 
-  form.addEventListener('submit', (e) => {
+  form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const name = input.value.replace(/\s+/g, ' ').trim();
+    const code = codeInput.value.trim();
     if (name.length < 2) { err.textContent = 'Please type your name (at least 2 letters).'; input.focus(); return; }
-    err.textContent = '';
-    begin(name);
+    if (!/^[0-9]{6}$/.test(code)) { err.textContent = 'Enter the six-digit code from your coach.'; codeInput.focus(); return; }
+    err.textContent = 'Joining session…';
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    try { await begin(name, code); }
+    catch (error) { err.textContent = error.message || 'Could not join this session.'; }
+    finally { if (submit) submit.disabled = false; }
   });
 }
 
+function sendScoreToCoach(correct, total) {
+  const status = document.getElementById('live-score-status');
+  fetch(API_BASE + '/api/sessions/' + CURRENT_SESSION_ID + '/scores', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ participantId: CURRENT_PARTICIPANT_ID, correct, total })
+  }).then(async response => {
+    let result = {};
+    try { result = await response.json(); } catch (e) {}
+    if (!response.ok) throw new Error(result.error || 'Score could not be sent.');
+    if (status) status.textContent = '✓ Score sent to your coach.';
+  }).catch(() => {
+    if (status) status.textContent = 'Could not reach the coach. Keep your score code and give it to your coach.';
+  });
+}
 function renderSendBox(rec) {
   const box = document.getElementById('send-box');
   if (!box || !rec || !rec.attempts.length) return;
@@ -6122,7 +6230,7 @@ function renderSendBox(rec) {
   const pct = Math.round((last.c / last.t) * 100);
   box.hidden = false;
   document.getElementById('send-summary').textContent =
-    `${rec.n} → ${last.c} / ${last.t} (${pct}%) on the guided notes. Best: ${best} / ${last.t}. Checks so far: ${rec.attempts.length}.`;
+    `${rec.n} → ${last.c} / ${last.t} (${pct}%) on the guided notes. Session ${rec.sessionId || CURRENT_SESSION_ID}. Best: ${best} / ${last.t}. Checks so far: ${rec.attempts.length}.`;
   const codeInput = document.getElementById('send-code');
   codeInput.value = scoreCodeFor(rec);
   const copyBtn = document.getElementById('send-copy');
@@ -6134,6 +6242,30 @@ function renderSendBox(rec) {
       try { navigator.clipboard.writeText(codeInput.value).then(done).catch(fail); } catch (e) { fail(); }
     });
   }
+}
+
+
+function initSessionExport() {
+  const button = document.getElementById('send-session-download');
+  if (!button) return;
+  button.addEventListener('click', () => {
+    const stored = readSessions().find(item => item.id === CURRENT_SESSION_ID);
+    if (!stored) return;
+    const session = Object.assign({}, stored, {
+      name: CURRENT_STUDENT,
+      attempts: (stored.attempts || []).filter(item => item.participantId === CURRENT_PARTICIPANT_ID)
+    });
+    const payload = { format: 'nihl-session-export', version: 1, exportedAt: Date.now(), sessions: [session] };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'NIHL_Session_' + CURRENT_SESSION_ID + '.json';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
 }
 
 </script>
