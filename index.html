@@ -2795,14 +2795,15 @@ h1, h2, h3, h4, .hero-title, .section-title, .brand-title { font-family: var(--f
     <form class="login-card" id="login-form" autocomplete="off" novalidate>
       <div class="brand-icon-box login-icon"></div>
       <h1 id="login-title">Welcome to the NIHL WebQuest</h1>
-      <p class="login-sub">Enter your coach's session code and your name to join. Your checked scores will appear on the coach's screen.</p>
+      <p class="login-sub">Join a coach's session with a code, or continue without one and share your score code afterward.</p>
       <label for="login-session-code" class="login-label">Coach's 6-digit session code</label>
       <input type="text" id="login-session-code" class="login-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="Enter session code">
-      <small class="login-session-help">Ask your coach for the code, then enter your name to join.</small>
+      <small class="login-session-help">Ask your coach for the code. Leave it blank if you want to continue without joining a shared session.</small>
       <label for="login-name" class="login-label">Your name</label>
       <input type="text" id="login-name" class="login-input" maxlength="60" placeholder="First and last name" autocomplete="off">
       <div class="login-error" id="login-error" role="alert"></div>
-      <button type="submit" class="btn btn-primary login-btn">Start the WebQuest →</button>
+      <button type="submit" class="btn btn-primary login-btn">Join with code →</button>
+      <button type="button" class="btn btn-secondary login-btn" id="login-no-code">Continue without code</button>
     </form>
   </div>
 
@@ -4475,6 +4476,7 @@ h1, h2, h3, h4, .hero-title, .section-title, .brand-title { font-family: var(--f
 const SCORE_SALT = 'nihl-salt-2026';
 let CURRENT_STUDENT = '';
 let CURRENT_PARTICIPANT_ID = '';
+let CURRENT_SESSION_OFFLINE = false;
 const API_BASE = location.protocol === 'file:' ? 'http://127.0.0.1:8765' : '';
 function slugName(n) { return String(n || '').toLowerCase().replace(/\s+/g, ' ').trim(); }
 function ukey(base) { return base + ':' + slugName(CURRENT_STUDENT); }
@@ -6141,10 +6143,10 @@ function initLogin(onReady) {
   const app = document.querySelector('.app-wrapper');
   let started = false;
 
-  async function begin(name, requestedCode, existingParticipantId) {
-    const code = String(requestedCode || '').trim();
-    if (!/^[0-9]{6}$/.test(code)) throw new Error('Enter the six-digit code from your coach.');
-    let participantId = existingParticipantId || '';
+  async function begin(name, requestedCode, existingParticipantId, standalone) {
+    const code = standalone ? newSessionCode() : String(requestedCode || '').trim();
+    if (!standalone && !/^[0-9]{6}$/.test(code)) throw new Error('Enter the six-digit code from your coach.');
+    let participantId = existingParticipantId || (standalone ? 'offline-' + (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2)) : '');
     if (!participantId) {
       let response;
       try {
@@ -6160,7 +6162,7 @@ function initLogin(onReady) {
         let result = {};
         try { result = await response.json(); } catch (e) {}
         if (!response.ok) {
-          if (location.protocol !== 'file:') throw new Error(result.error || 'That session code is not active. Check with your coach.');
+          if (response.status !== 404) throw new Error(result.error || 'Could not join the session. Check with your coach.');
           participantId = 'offline-' + (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
         } else participantId = result.participantId;
       }
@@ -6168,10 +6170,11 @@ function initLogin(onReady) {
     CURRENT_STUDENT = name;
     CURRENT_SESSION_ID = code;
     CURRENT_PARTICIPANT_ID = participantId;
+    CURRENT_SESSION_OFFLINE = String(participantId).startsWith('offline-');
     sessSet('hosa_nihl_student', name);
     sessSet('hosa_nihl_session_id', code);
     sessSet('hosa_nihl_participant_id', participantId);
-    ensureSession(name, code, 'live');
+    ensureSession(name, code, CURRENT_SESSION_OFFLINE ? 'standalone' : 'live');
     if (screen) screen.hidden = true;
     if (app) app.inert = false;
     document.body.classList.remove('locked');
@@ -6206,10 +6209,27 @@ function initLogin(onReady) {
     catch (error) { err.textContent = error.message || 'Could not join this session.'; }
     finally { if (submit) submit.disabled = false; }
   });
+
+  const noCodeBtn = document.getElementById('login-no-code');
+  if (noCodeBtn) noCodeBtn.addEventListener('click', async () => {
+    const name = input.value.replace(/\s+/g, ' ').trim();
+    if (name.length < 2) { err.textContent = 'Please type your name (at least 2 letters).'; input.focus(); return; }
+    err.textContent = 'Starting a standalone run…';
+    noCodeBtn.disabled = true;
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    try { await begin(name, '', '', true); }
+    catch (error) { err.textContent = error.message || 'Could not start the WebQuest.'; }
+    finally { noCodeBtn.disabled = false; if (submit) submit.disabled = false; }
+  });
 }
 
 function sendScoreToCoach(correct, total) {
   const status = document.getElementById('live-score-status');
+  if (CURRENT_SESSION_OFFLINE) {
+    if (status) status.textContent = 'Standalone session: give your score code to your coach to add this result.';
+    return;
+  }
   fetch(API_BASE + '/api/sessions/' + CURRENT_SESSION_ID + '/scores', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ participantId: CURRENT_PARTICIPANT_ID, correct, total })
